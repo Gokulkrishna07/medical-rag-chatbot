@@ -13,7 +13,9 @@ Pipeline:
 import os
 import pickle
 import re
+import time
 from dataclasses import dataclass, field
+ 
 
 import faiss
 import numpy as np
@@ -46,6 +48,9 @@ class ChatResponse:
     sources:       list[str]       = field(default_factory=list)
     retrieved_docs: list[RetrievedDoc] = field(default_factory=list)
     found:         bool            = True
+    embedding_latency: float       = 0.0
+    search_latency:    float       = 0.0
+    total_latency:     float       = 0.0
 
 
 # ── Answer formatter (offline, no LLM) ────────────────────────────────────────
@@ -194,11 +199,16 @@ class MedRAGChatbot:
 
     # ── Retrieval ──────────────────────────────────────────────────────────────
 
-    def retrieve(self, query: str) -> list[RetrievedDoc]:
+    def retrieve(self, query: str) -> tuple[list[RetrievedDoc], float, float]:
+        """Return (docs, embedding_latency, search_latency) in seconds."""
+        t0 = time.time()
         query_emb = self.embedder.encode([query], convert_to_numpy=True).astype("float32")
         faiss.normalize_L2(query_emb)
+        embedding_latency = time.time() - t0
 
+        t1 = time.time()
         scores, indices = self.index.search(query_emb, self.top_k)
+        search_latency = time.time() - t1
 
         docs = []
         for score, idx in zip(scores[0], indices[0]):
@@ -214,7 +224,7 @@ class MedRAGChatbot:
                     score=float(score),
                 )
             )
-        return docs
+        return docs, embedding_latency, search_latency
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -223,12 +233,17 @@ class MedRAGChatbot:
         Retrieve relevant documents and return a structured offline answer.
 
         Returns a ChatResponse with:
-          - answer        : formatted text answer
-          - sources       : deduplicated source labels
-          - retrieved_docs: raw retrieved RetrievedDoc objects
-          - found         : False if no relevant docs were found
+          - answer            : formatted text answer
+          - sources           : deduplicated source labels
+          - retrieved_docs    : raw retrieved RetrievedDoc objects
+          - found             : False if no relevant docs were found
+          - embedding_latency : seconds spent embedding the query
+          - search_latency    : seconds spent on FAISS search
+          - total_latency     : total seconds for the full chat() call
         """
-        docs = self.retrieve(query)
+        t_start = time.time()
+        docs, embedding_latency, search_latency = self.retrieve(query)
+        total_latency = time.time() - t_start
 
         if not docs:
             return ChatResponse(
@@ -239,6 +254,9 @@ class MedRAGChatbot:
                 sources=[],
                 retrieved_docs=[],
                 found=False,
+                embedding_latency=embedding_latency,
+                search_latency=search_latency,
+                total_latency=total_latency,
             )
 
         answer = format_answer(query, docs)
@@ -254,6 +272,9 @@ class MedRAGChatbot:
             sources=sources,
             retrieved_docs=docs,
             found=True,
+            embedding_latency=embedding_latency,
+            search_latency=search_latency,
+            total_latency=total_latency,
         )
 
 
