@@ -1,0 +1,144 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy Medical RAG Chatbot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p ${{ secrets.VM_PORT }} ${{ secrets.VM_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Sync project files to VM
+        run: |
+          rsync -avz --delete \
+            -e "ssh -p ${{ secrets.VM_PORT }} -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='venv' \
+            --exclude='*.pyc' \
+            ./ ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}:/home/${{ secrets.VM_USER }}/medical-rag-chatbot/
+
+      - name: Install dependencies on VM
+        run: |
+          ssh -p ${{ secrets.VM_PORT }} \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "
+            cd /home/${{ secrets.VM_USER }}/medical-rag-chatbot
+            python3 -m venv venv
+            venv/bin/pip install --upgrade pip --quiet
+            venv/bin/pip install -r requirements.txt --quiet
+          "
+
+      - name: Install systemd service (idempotent)
+        run: |
+          ssh -p ${{ secrets.VM_PORT }} \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "
+            # Write systemd service file
+            sudo tee /etc/systemd/system/medical-rag-chatbot.service > /dev/null << 'SERVICE'
+          [Unit]
+          Description=Medical RAG Chatbot (Streamlit)
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=${{ secrets.VM_USER }}
+          WorkingDirectory=/home/${{ secrets.VM_USER }}/medical-rag-chatbot
+          ExecStart=/home/${{ secrets.VM_USER }}/medical-rag-chatbot/venv/bin/streamlit run app.py \
+              --server.port 8502 \
+              --server.baseUrlPath /medical-rag-chatbot \
+              --server.headless true \
+              --server.enableCORS false \
+              --server.enableXsrfProtection false \
+              --server.address 127.0.0.1
+          Restart=on-failure
+          RestartSec=10
+          Environment=PYTHONUNBUFFERED=1
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+            sudo systemctl daemon-reload
+            sudo systemctl enable medical-rag-chatbot
+          "
+
+      - name: Configure nginx (idempotent)
+        run: |
+          ssh -p ${{ secrets.VM_PORT }} \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "
+            # Write nginx location snippet
+            sudo mkdir -p /etc/nginx/snippets
+            sudo tee /etc/nginx/snippets/medical-rag-chatbot.conf > /dev/null << 'NGINX'
+          upstream streamlit_app {
+              server 127.0.0.1:8502;
+          }
+
+          location /medical-rag-chatbot/ {
+              proxy_pass         http://streamlit_app/medical-rag-chatbot/;
+              proxy_http_version 1.1;
+              proxy_set_header   Upgrade    \$http_upgrade;
+              proxy_set_header   Connection \"upgrade\";
+              proxy_set_header   Host       \$host;
+              proxy_set_header   X-Real-IP  \$remote_addr;
+              proxy_read_timeout  86400;
+              proxy_send_timeout  86400;
+          }
+
+          location = /medical-rag-chatbot {
+              return 301 /medical-rag-chatbot/;
+          }
+          NGINX
+
+            # Include snippet in existing nginx server block (idempotent)
+            INCLUDE_LINE='include /etc/nginx/snippets/medical-rag-chatbot.conf;'
+            NGINX_CONF=\$(sudo nginx -T 2>/dev/null | grep -l 'listen 8501' || echo '/etc/nginx/sites-enabled/default')
+            if ! sudo grep -qr 'medical-rag-chatbot.conf' /etc/nginx/; then
+              echo 'Snippet not yet included — you must manually add the include line to your nginx server block.'
+              echo \"Add inside server { listen 8501; } block: \$INCLUDE_LINE\"
+            else
+              echo 'Nginx snippet already included.'
+            fi
+
+            sudo nginx -t && sudo systemctl reload nginx
+          "
+
+      - name: Restart Streamlit service
+        run: |
+          ssh -p ${{ secrets.VM_PORT }} \
+              -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} "
+            sudo systemctl restart medical-rag-chatbot
+            sleep 5
+            sudo systemctl status medical-rag-chatbot --no-pager
+          "
+
+      - name: Health check
+        run: |
+          sleep 10
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://${{ secrets.VM_HOST }}:8501/medical-rag-chatbot)
+          echo "HTTP response: $HTTP_CODE"
+          if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 301 ] || [ "$HTTP_CODE" -eq 302 ]; then
+            echo "Deployment successful!"
+          else
+            echo "Health check failed with code $HTTP_CODE"
+            exit 1
+          fi
